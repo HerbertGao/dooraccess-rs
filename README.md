@@ -1,67 +1,44 @@
 # dooraccess-rs
 
-把**安居宝**品牌的可视门禁接入 HomeAssistant 的 Rust daemon，跑在 **MikroTik hAP ac lite**（QCA9533，MIPS 24Kc 大端，无 FPU，OpenWrt musl，64 MB RAM）上，替换原有闭源门禁固件。
+安居宝可视门禁的 Rust 程序。它跑在家里的小路由器上，把门外的门铃接到 Home Assistant：有人按铃会通知你，也可以按设置自动开门，并把门口画面转成视频流。
 
-整个 daemon 只依赖 `std + libc`——安居宝二进制协议、PF_PACKET 抓帧、RTP/H.264 分片重组、FLV 封装、裸 HTTP/1.1 全部手写，不引入任何重型 crate。最终产物是一个 **全静态、MIPS 大端、softfloat、~573 KB** 的单文件二进制。
+它只做安居宝这一家，用来替换原来的闭源门禁程序。目标机器是 MikroTik hAP ac lite，一台 64MB 内存的 MIPS 路由器。编出来是一个大约 570KB 的单文件，不依赖别的运行库。
 
-## 特性
+## 能做什么
 
-- **安居宝 TCP 18022 协议**：`req=NNN&query=…` 二进制 wire 帧——开锁（518 三步握手 + 响铃状态不匹配重试）、视频预览启停（704 / 708）、电梯呼叫（710 appoint）等。
-- **UDP 6672 按键事件监听**：按 byte19 trailer 区分响铃（`0x94`）/ 呼梯（`0x90`）；号码查询应答。
-- **PF_PACKET PROMISC + BPF**：在门禁网卡上抓 6672 / 18022 帧，大端平台正确（平台无关 `htons`）。
-- **裸 HTTP/1.1 控制接口**：无 Web 框架，自带 mux + 中间件链（见下表）。
-- **HomeAssistant 反向 push**：`event=ring / unlock / automation_state`，用 HA Long-Lived Token。
-- **响铃自开锁**：ring → 自动开门；`automation.state` 持久 flag 驱动（加载优先级 `state > config > env`），运行时可经 HTTP 拨动并写盘。
-- **视频转发**：外机 RTP/RTCP/H.264（UDP 9880）→ 专有分片重组成帧 → 切 NAL → FLV 封装 → HTTP chunked 流；会话 TTL + 多消费者非阻塞 fan-out。
-- **带时间戳日志**：每条日志行进程内自带墙钟时间戳 `dooraccess-rs: YYYY/MM/DD HH:MM:SS.mmm <msg>`，不依赖 syslog。
+- 听门铃，通知 Home Assistant
+- 开门；有人按铃时也可以自动开门
+- 把门口画面转成 FLV，给 HA 拉流
+- 运行中开关「自动开门」和「自动挂断」，设置写在磁盘上，重启还在
 
-## 架构
+## 先看哪份
 
-并发模型：保留 PF_PACKET listener 线程（18022 / 6672）+ 单 worker + job 队列 + 单个 `Arc<AtomicBool>` 状态位；wire 出站串行经 worker，避免锁竞争。
-
-| 范围 | 模块 |
+| 你要做的事 | 文档 |
 |---|---|
-| 协议核心 | `codec`（BCD / req 编号 / result 表）、`wire18022`（wire 模板字节级）、`listen18022` / `listen6672`（PF_PACKET + BPF）、`bpf`、`ffi`（libc 封装 + const-assert 守门） |
-| HTTP / 控制 | `httpx`（bare HTTP/1.1）、`control`（控制面 endpoint + automation state）、`info`（自描述） |
-| daemon 编排 | `daemon`（线程 / 关闭）、`orchestration`（接线）、`self_unlock`（响铃自开锁消费者）、`automation_state`（持久 flag 原子写） |
-| 开锁 | `unlock`（710 + 518 三步 + 重试）、`wire_sender` / `sender`（SO_BINDTODEVICE 出站） |
-| 视频 | `video/`：`preview`（704/708 信令）、`rtp` / `rtcp`、`reassembler`（专有分片重组）、`frame_buffer`（fan-out）、`transmux`（FLV）、`session`（TTL / 生命周期） |
-| 日志 | `log`（中央带戳日志层 + 机械门禁） |
+| 写配置、调接口 | [docs/usage.md](docs/usage.md) |
+| 装到路由器上 | [docs/deploy.md](docs/deploy.md) |
+| 编译，或改代码 | [docs/develop.md](docs/develop.md) |
 
-## HTTP 控制接口
+装到那台 64MB 路由器上时，逐步命令以 `dooraccess-go/DEPLOY.md` 为准，不要自己发明步骤。安装和回滚的概览在 [package/README.md](package/README.md)。
 
-监听 `0.0.0.0:8080`（裸 HTTP/1.1）。
+## 配置长什么样
 
-| 方法 / 路径 | 用途 |
-|---|---|
-| `GET /info` | daemon 自描述 / 探活（brand / monitor / stations / video 字段） |
-| `POST /unlock` | 开锁（710 + 518 三步握手，含响铃状态不匹配重试） |
-| `POST /auto_unlock` | 拨动「响铃自开锁」flag（body `{"on":bool}`），写盘持久 |
-| `POST /auto_hangup` | 拨动「自动挂断」flag，写盘持久 |
-| `GET /automation` | 返回当前 automation 状态 |
-| `POST /video/start` | 启动视频会话（body `{"outdoor":"<外机URI>"}`，须在 `stations` allowlist 内）→ `{session_id, stream_url, ttl}` |
-| `GET /video/<id>/stream.flv` | 拉 FLV 视频流（chunked） |
-| `POST /video/stop` | 停止视频会话（发 req=708 + RTCP BYE） |
-| `GET /playback` | 回放（预留 stub） |
-
-## 配置
-
-INI 格式（默认 `/etc/dooraccess-go/config.ini`，可经 `--config <path>` 覆盖；生产 init.d 传中性路径 `/etc/dooraccess/config.ini`）：
+程序读一份 INI。下面的号码和地址都是占位，换成你自己的：
 
 ```ini
-sip = 06021103@172.16.106.91:18022     ; 本机室内机（monitor）URI
-iface = br-door                         ; 门禁网卡（PF_PACKET 抓帧 + 出站绑定）
+sip = 01020304@192.0.2.10:18022          ; 室内机
+iface = br-door                          ; 门禁网卡
 
 [listen]
 addr = 0.0.0.0
 port = 8080
 
-[station "1"]                           ; 外机（可多个 station "N"）
-sip = 06020000@172.16.106.152:18022
+[station "1"]                            ; 门外机，可以写多个
+sip = 01020000@192.0.2.20:18022
 
 [hass]
-api = http://172.16.106.x:8123          ; HomeAssistant 地址
-token = <HA Long-Lived Token>           ; 反向 push 用
+api = http://192.0.2.30:8123
+token = <HA Long-Lived Token>
 
 [video]
 forward = true
@@ -72,57 +49,17 @@ auto_unlock = false
 auto_hangup = false
 ```
 
-运行时 automation flag 持久态默认 `/etc/dooraccess-go/automation.state`，**可经 `--state <path>` 覆盖**（state 路径不从 config 派生；生产 init.d 传中性路径 `/etc/dooraccess/automation.state`）；文件缺失（首装/从未拨 flag）回落 `[automation]` 出厂默认。
+字段说明在 [docs/usage.md](docs/usage.md)。
 
-## 构建
+## 在自己电脑上试一下
 
 ```bash
-# host（stable）—— 自检构建 / 测试
 make build
 make test
-
-# MIPS 交叉构建（一次性环境准备）
-rustup toolchain install nightly --profile minimal
-rustup component add rust-src llvm-tools-preview --toolchain nightly
-make fetch-sdk        # 下载 + 解压 OpenWrt mips_24kc musl sysroot 到 .openwrt-sdk/
-
-# 交叉构建 + 校验 + 产物
-make build-mips       # → target/mips-unknown-linux-musl/release/dooraccess-rs
-make verify-mips      # 断言 MIPS 大端 + softfloat + 全静态
-make dist             # 校验并拷到 dist/dooraccess-rs-mips（注：dist 不触发 build-mips，改源后先 build-mips）
 ```
 
-`mips-unknown-linux-musl` 是 Rust **Tier 3** 目标：rustup 不带预编译 std，须 `-Z build-std` 从 `rust-src` 现编 std，并链外部 musl sysroot。`scripts/link-mips.sh` 用宿主机原生的 `rust-lld` + SDK 静态库做全静态、非 PIE 链接，因此 **macOS arm64 也能直接出 MIPS 二进制**（不跑 SDK 自带的 Linux gcc）。
+要出路由器上的程序，见 [docs/develop.md](docs/develop.md)。
 
-> macOS 上若 `cargo` 解析到 Homebrew 版（不懂 `+nightly`），把 rustup proxy 提前：`PATH="$HOME/.cargo/bin:$PATH" make build-mips`。
+## 现在到哪了
 
-## 测试与质量门禁
-
-```bash
-make test                       # cargo test（含协议 golden / 字节保真 / 降级路径单测）
-make clippy                     # cargo clippy --all-targets，零警告
-bash scripts/check-log-gate.sh  # 日志门禁：无残留无戳直写 stderr + log.rs 零 unwrap/expect + 单次加锁写
-```
-
-仓库装有 `.git/hooks/pre-commit`（`cargo fmt --check`），未格式化禁止提交。
-
-## 部署到 hAP
-
-交叉构建产物是单文件全静态二进制。两种部署形态：
-
-- **正式生产（procd 托管）**：装 `/usr/bin/dooraccess-rs` + `package/files/etc/init.d/dooraccess-rs`（procd respawn、开机自启、无 GOMEMLIMIT），config/state 走中性路径 `/etc/dooraccess/`，Go 作冻结紧急回滚根。安装/回滚概览见 [`package/README.md`](package/README.md)，**完整权威 SOP 见 `dooraccess-go/DEPLOY.md` §Rust 生产部署 P0-P13**。
-- **临时验证 swap（setsid）**：`scp -O` 到 `/tmp/dooraccess-rs` → `setsid /tmp/dooraccess-rs --config <cfg> --state <state> >/tmp/rust.log 2>&1 &`（hAP busybox 有 `setsid`、无 `nohup`），测完恢复 Go。见 `DEPLOY.md` §Rust 临时验证 swap R1-R7。
-
-> ⚠️ hAP ac lite 64 MB RAM 极紧：`ls -l` 核字节数（**禁 `sha256sum`/`md5sum`**——读全文件进 RAM 触发 OOM）；SSH 必加 `-o ConnectTimeout=8 -o ServerAliveInterval=15`，失败立即停手不 retry。**任何真机操作走 DEPLOY.md，禁自创流程。**
-
-## 开发约定
-
-- **crate gate = `std + libc` only**：`libc` 是唯一外部依赖，破口框死在三处 PF_PACKET / SO_BINDTODEVICE FFI；拒 nix / pnet / socket2 / tokio。要放宽须走 OpenSpec change。
-- **MIPS32 红线**：禁 64 位原子（TTL 用 `Mutex<Instant>`、tunable 用 `AtomicU32`）。
-- **规格驱动**：行为变更走 OpenSpec change（提案 → 实现 → 归档生效）。
-- **改动走 PR + Bugbot 复审**。
-- `release` profile：`panic=abort` + LTO + `opt-level=z` + strip（体型优先）。
-
-## 项目状态
-
-完整 daemon 已实现并在 hAP 上**灰度运行**：协议核心 / HTTP 控制面 / PF_PACKET listener / 响铃自开锁 / 视频转发 / 带戳日志全栈就位。真机验证：响铃自开锁**物理门开**、HACS 端到端**收到视频流**、PF_PACKET 大端取帧、日志带时间戳。
+v1.0.0 起已在 hAP 上作为正式服务运行。按铃自动开门在真机上开过门，Home Assistant 能收到视频。v1.0.1 修了画面大约 16 秒后冻住的问题；这次改动的长时间画面还没在真机上复测。
