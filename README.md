@@ -1,29 +1,29 @@
 # dooraccess-rs
 
-安居宝可视门禁的 Rust 程序。它跑在家里的小路由器上，把门外的门铃接到 Home Assistant：有人按铃会通知你，也可以按设置自动开门，并把门口画面转成视频流。
+安居宝可视门禁的 Rust 守护进程。运行于 OpenWrt，将门铃事件、开锁和门口视频接入 Home Assistant，用于替换原闭源门禁程序。仅支持安居宝。
 
-它只做安居宝这一家，用来替换原来的闭源门禁程序。目标机器是 MikroTik hAP ac lite，一台 64MB 内存的 MIPS 路由器。编出来是一个大约 570KB 的单文件，不依赖别的运行库。
+部署平台为 MikroTik hAP ac lite（RB952Ui-5ac2nD）。安居宝室外机的上行网线提供 24V passive PoE；该机型 ether1 接受 10–28V passive PoE，可由该网线供电，无需另接电源。CPU 为 QCA9533（MIPS 24Kc，大端，无 FPU），内存 64MB。发布产物为全静态、softfloat 的单文件二进制，体积约 570KB。
 
-## 能做什么
+## 功能
 
-- 听门铃，通知 Home Assistant
-- 开门；有人按铃时也可以自动开门
-- 把门口画面转成 FLV，给 HA 拉流
-- 运行中开关「自动开门」和「自动挂断」，设置写在磁盘上，重启还在
+- 接收门铃事件并通知 Home Assistant
+- 开锁；可在门铃触发时自动开锁
+- 将门口视频转发为 FLV，供 Home Assistant 拉取
+- 运行时切换自动开锁与自动挂断；状态持久化，重启后保留
 
-## 先看哪份
+## 文档
 
-| 你要做的事 | 文档 |
+| 内容 | 位置 |
 |---|---|
-| 写配置、调接口 | [docs/usage.md](docs/usage.md) |
-| 装到路由器上 | [docs/deploy.md](docs/deploy.md) |
-| 编译，或改代码 | [docs/develop.md](docs/develop.md) |
+| 配置与 HTTP 接口 | [docs/usage.md](docs/usage.md) |
+| 部署 | [docs/deploy.md](docs/deploy.md) |
+| 构建与开发约束 | [docs/develop.md](docs/develop.md) |
 
-装到那台 64MB 路由器上时，逐步命令以 `dooraccess-go/DEPLOY.md` 为准，不要自己发明步骤。安装和回滚的概览在 [package/README.md](package/README.md)。
+在 hAP ac lite 上替换二进制、重启或修改启动项时，按 `dooraccess-go/DEPLOY.md` 执行。安装与回滚概览见 [package/README.md](package/README.md)。
 
-## 配置长什么样
+## 配置示例
 
-程序读一份 INI。下面的号码和地址都是占位，换成你自己的：
+配置为 INI。下列号码与地址均为占位值。
 
 ```ini
 sip = 01020304@192.0.2.10:18022          ; 室内机
@@ -33,7 +33,7 @@ iface = br-door                          ; 门禁网卡
 addr = 0.0.0.0
 port = 8080
 
-[station "1"]                            ; 门外机，可以写多个
+[station "1"]                            ; 室外机，可配置多项
 sip = 01020000@192.0.2.20:18022
 
 [hass]
@@ -49,17 +49,17 @@ auto_unlock = false
 auto_hangup = false
 ```
 
-字段说明在 [docs/usage.md](docs/usage.md)。
+字段说明见 [docs/usage.md](docs/usage.md)。
 
-## 在自己电脑上试一下
+## 构建
 
 ```bash
 make build
 make test
 ```
 
-要出路由器上的程序，见 [docs/develop.md](docs/develop.md)。
+MIPS 交叉构建见 [docs/develop.md](docs/develop.md)。
 
-## 现在到哪了
+## 状态
 
-v1.0.0 起已在 hAP 上作为正式服务运行。按铃自动开门在真机上开过门，Home Assistant 能收到视频。v1.0.1 修了画面大约 16 秒后冻住的问题；这次改动的长时间画面还没在真机上复测。
+v1.0.0 起已在 hAP ac lite 上以 procd 服务运行。门铃自动开锁已完成物理验证，Home Assistant 可接收视频。v1.0.1 修复约 16 秒后画面冻结的问题；该改动的长时间视频尚未在真机复测。
